@@ -1,0 +1,4 @@
+.cache/*
+build/*
+mcu_firmware.bin
+send.sh

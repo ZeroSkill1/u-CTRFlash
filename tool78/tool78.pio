@@ -1,0 +1,214 @@
+
+; 5+10+3 insns = 18 insns
+
+; technially there are 5 or 6 physical layer protocols across 3 device
+; generations, but data transfers (not entry sequences & pinout) can be grouped
+; in 3 categories: SPI (78k0/Kx2), two-wire UART (78k/Kx2 and RL78), and
+; single-wire UART (78K0R/Kx3-L and RL78). UART has a small peculiarity: MCU to
+; host transfers use 8n1 formatting, while host to MCU transfers are 8n2.
+;
+; furthermore, we can unify the single-wire and two-wire UARTs by doing the
+; following:
+; * TX, RX lines pullup
+; * TX: set pin drive value to 0, but change pin direction for writing
+; * RX: the usual
+
+.program tool78_uart_tx
+.side_set 1 opt pindirs
+
+; 8n2
+; no autopull
+; uses both out pin and sideset pin
+; bit period = 1/8 PIO cycle period
+
+	; here we use side=1 to drive a pin high, and side=0 to drive it low,
+	; as well as using out to set the line.
+	; however, these are direction values and not output values, 1 would be
+	; "output" and 0 is "input"/"default to pullup/pulldown". output is fixed
+	; to a low level, so the code below would invert things... to fix this, we
+	; invert the output enable setting in the IO multiplexer padsbank stuff
+
+	;set pindirs, 1      [7]    ; first stop bit
+	nop          side 1 [7]
+	;pull                [7]    ; second stop bit, only continue when data is there
+	pull         side 1 [7]    ; second stop bit, only continue when data is there
+	;set pindirs, 0             ; start bit
+	;set x, 7            [6]    ; start bit
+	set x, 7     side 0 [7]    ; start bit
+loop:
+	out pindirs, 1             ; output a single bit
+	jmp x-- loop        [6]
+
+% c-sdk {
+
+#include <hardware/clocks.h>
+#include <hardware/structs/iobank0.h>
+
+static inline void tool78_uart_tx_program_init(PIO pio, uint sm, uint offset,
+		uint pin, uint baudrate, bool en) {
+	// needs to work on a one-wire half-duplex line:
+	// * use internal pullup
+	// * drive output low, always
+	// * use pin direction setting to send data
+	// * default to hiZ/pullup after initc
+	gpio_set_function(pin, GPIO_FUNC_SIO); // also sets input/output enables properly
+	pio_sm_set_pins_with_mask(pio, sm, 0u << pin, 1u << pin);
+	pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true); // pin is output by default EXCEPT negated to input! (i.e. pullup)
+	gpio_pull_up(pin);
+	//gpio_set_oeover(pin, GPIO_OVERRIDE_INVERT); // see note in PIO code
+	//pio_gpio_init(pio, pin);
+	// we need to perform the above two at once to avoid a spurious glitch
+	// where the line goes low for a few cycles
+	iobank0_hw->io[pin].ctrl
+		= (((pio==pio0)?GPIO_FUNC_PIO0:GPIO_FUNC_PIO1) << IO_BANK0_GPIO0_CTRL_FUNCSEL_LSB)
+		| (GPIO_OVERRIDE_INVERT << IO_BANK0_GPIO0_CTRL_OEOVER_LSB);
+
+	pio_sm_config c = tool78_uart_tx_program_get_default_config(offset);
+
+	// no autopull, shifting out MSb first
+	sm_config_set_out_shift(&c, false, false, 8);
+	// only need an output FIFO
+	sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+	sm_config_set_out_pins(&c, pin, 1);
+	//sm_config_set_set_pins(&c, pin, 1);
+	sm_config_set_sideset_pins(&c, pin);
+
+	float div = (float)clock_get_hz(clk_sys) / (8*baudrate);
+	sm_config_set_clkdiv(&c, div);
+
+	pio_sm_init(pio, sm, offset, &c);
+	pio_sm_set_enabled(pio, sm, en);
+}
+
+%}
+
+.program tool78_uart_rx
+;.side_set 1
+
+; 8n1
+; no autopush
+; uses in and jmp pin for rx
+; bit period = 1/8 PIO cycle period
+
+start:
+	wait 0 pin 0            ;side 0 ; wait for start bit
+	set x, 7           [10] ;side 1 ; 8 data bits. delay until middle of data bit period
+loop:
+	in pins, 1              ;side 0 ; read the bit
+	jmp x-- loop       [ 6] ;side 0
+
+public stopbit_magic:
+	jmp pin stop_ok         ;side 0 ; if pin high (stop bit): all is ok
+
+	irq 4 rel               ;side 0 ; set sticky flag due to missing stop bit
+	mov isr, null           ;side 0 ; clear shift reg as the data is nonsense
+	wait 1 pin 0            ;side 0 ; wait until line goes idle/high again
+	jmp start               ;side 0 ; restart
+
+public stop_ok:
+	push                    ;side 0
+
+% c-sdk {
+
+static inline void tool78_uart_rx_program_init(PIO pio, uint sm, uint offset,
+		uint pin, uint baudrate, bool en, bool check_stop_bit) {
+	//const int PIN_DBG = 4;
+
+	pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false); // pin is input now
+	pio_gpio_init(pio, pin);
+	gpio_pull_up(pin);
+
+	//pio_sm_set_consecutive_pindirs(pio, sm, PIN_DBG, 1, true);
+	//pio_gpio_init(pio, PIN_DBG);
+
+	if (!check_stop_bit) {
+		pio->instr_mem[offset + tool78_uart_rx_offset_stopbit_magic]
+			= pio_encode_jmp(offset + tool78_uart_rx_offset_stop_ok);
+	} else {
+		pio->instr_mem[offset + tool78_uart_rx_offset_stopbit_magic]
+			= pio_encode_jmp_pin(offset + tool78_uart_rx_offset_stop_ok);
+	}
+
+	pio_sm_config c = tool78_uart_rx_program_get_default_config(offset);
+	sm_config_set_in_pins(&c, pin);
+	sm_config_set_jmp_pin(&c, pin);
+	//sm_config_set_sideset_pins(&c, PIN_DBG);
+
+	// no autopull, MSb first
+	sm_config_set_in_shift(&c, false, false, 8);
+	sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+	float div = (float)clock_get_hz(clk_sys) / (8*baudrate);
+	sm_config_set_clkdiv(&c, div);
+
+	pio_sm_init(pio, sm, offset, &c);
+	pio_sm_set_enabled(pio, sm, en);
+	//gpio_put(3, true);
+}
+
+//static inline void tool78_uart_rx_enable_stop(PIO pio, uint offset) {
+//	/*pio->instr_mem[offset + tool78_uart_rx_offset_stopbit_magic] =
+//		pio_encode_jmp_pin(offset + tool78_uart_rx_offset_stop_ok);*/
+//}
+//static inline void tool78_uart_rx_disable_stop(PIO pio, uint offset) {
+//	/*pio->instr_mem[offset + tool78_uart_rx_offset_stopbit_magic] =
+//		pio_encode_push(false, true)
+//		//pio_encode_jmp(offset + tool78_uart_rx_offset_stop_ok)
+//		;*/
+//}
+
+// TODO: IRQ handling!
+
+%}
+
+.program tool78_spi
+.side_set 1
+
+; nSCK: side-set pin
+; MOSI: out pin
+; MISO: in pin
+
+; CPHA1: set on falling edge, read on rising edge. clk high when idle
+; CPOL1: can do this in IO muxing controls: GPIOx_CTRL.OUTOVER = 1
+;        => gpio_set_outover(pin, GPIO_OVERRIDE_INVERT)
+;        this means we have to write out code such that it reads/samples on the
+;        "falling" edge, i.e. code it as if we're doing CPHA1 CPOL0
+
+	out x, 1      side 0
+	mov pins, x   side 1 [1]
+	in  pins, 1   side 0
+
+% c-sdk {
+
+static inline void tool78_spi_program_init(PIO pio, uint sm, uint offset,
+		uint pin_nsck, uint pin_mosi, uint pin_miso, uint freq, bool en) {
+	// clock deafults to high, let's not care about the rest yet
+	pio_sm_set_pins_with_mask(pio, sm, 0u << pin_nsck, 1u << pin_nsck);
+	gpio_set_outover(pin_nsck, GPIO_OVERRIDE_INVERT); // see note in PIO code
+	// SPI is clocked & synchronous, so we can bypass this
+	hw_set_bits(&pio->input_sync_bypass, 1u << pin_miso);
+
+	pio_gpio_init(pio, pin_nsck);
+	pio_gpio_init(pio, pin_mosi);
+	pio_gpio_init(pio, pin_miso);
+
+	pio_sm_config c = tool78_spi_program_get_default_config(offset);
+
+	sm_config_set_out_pins(&c, pin_mosi, 1);
+	sm_config_set_in_pins (&c, pin_miso);
+	sm_config_set_sideset_pins(&c, pin_nsck);
+
+	// MSb first, 8 bit, autopush & autopull
+	sm_config_set_out_shift(&c, false, true, 8);
+	sm_config_set_in_shift (&c, false, true, 8);
+
+	float div = (float)clock_get_hz(clk_sys) / freq;
+	sm_config_set_clkdiv(&c, div);
+
+	pio_sm_init(pio, sm, offset, &c);
+	pio_sm_set_enabled(pio, sm, en);
+}
+
+%}
+

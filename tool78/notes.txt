@@ -1,0 +1,227 @@
+NOTE: RL78/G23 (and presumably other x2y chips) add more commands, not listed below!
+NOTE: RL78/G10, G1M, G1N have a very limited commandset, which is quite different!
+
+---
+
+NOTE: ALWAYS CONNECT REGC TO CAPACITOR OF 0.47..1 uF (going to GND)
+
+
+  FFFC0h -   --- Undef PFCMD      (used in the self programming library) (!)
+  FFFC1h     1B                   Undoc:
+  FFFC2h -   --- 00h   PFS        (used in the self programming library) (!)
+  FFFC4h -   --- 00h   FLPMC      (used in the self programming library) (!)
+
+	unlock bootrom:
+		PFCMD = 0xA5
+		FLPMC = 0x01
+		FLPMC = 0xFE
+		FLPMC = 0x01
+		-> bootrom now at 0x8000..
+
+
+	rl78 unlock:
+		set bit 0 of 0xf0090
+		set 0xf0803 to 1
+		 theet 0xf0880 to 4
+		mapped to 0xe0000
+
+		IO registers:
+			0xf0090 (1B) - ROM enable (bit 0)
+
+			0xf0800 (2B) - request index / descriptor pointer top? (in 0xf0801)
+			0xf0802 (1B) - fixed 0xff byte?
+			0xf0803 (1B) - fixed 1 byte?
+			0xf0804 (2B) - request pointer / descriptor pointer
+			0xf0806 (2B) - request byte count (0x400 for erase)
+
+			0xf0880 (1B) - idk? fixed 4 or 4, also ROM enable?
+			0xf0881 (1B) - command enum
+
+			0xffef0 (1B) - status byte
+		ROM functions:
+			0xef004 - Handler()
+			0xef008 - Close()
+			0xefff8 - Execute()
+
+
+		Open():
+			set1 !0xf0090.0
+			movw !0xf0804, <descriptor pointer?>
+			mov  !0xf0801, <descriptor pointer top?>
+			oneb !0xf0803 // oneb x = movw x, #1
+			call !!0xefff8
+			mov  !0xf0880, #4
+			mov   0xffef0, c? # c = retval
+
+		Close():
+			call !!0xef008
+			clr1 !0xf0090.0
+			clrb !0xf0880
+
+		Execute():
+			oneb !0xf0803 // oneb x = movw x, #1
+			movw !0xf0804, requestptr->data_pu08
+			mov  !0xf0802, #0xf
+			mov  !0xf0881, requestptr->command_enu
+			if (requestptr->command_enu == 3 /* erase block */) {
+				movw !0xf0806, #0x0400
+				movw !0xf0800, 0x1000 + ((requestptr->index_u16 & 0xff) << 8)
+			} else {
+				movw !0xf0800, requestptr->index_u16
+				movw !0xf0806, requestptr->bytecount_u16
+				if (requestptr->command_enu == 0 /* read */) {
+					movw [!0wf0804], [0x1000]
+					memcpy(requestptr->data_pu08, requestptr->index_u16,
+							requestptr->bytecount_u16);
+				}
+				mov 0xffef0, 0
+				return // ?
+			}
+			mov c, !0xf0881
+			call !!0xefff8
+			mov a, c
+			mov 0xffef0, a
+
+		Handler():
+			call !!0xef004
+			mov  0xffef0, c? # c = retval
+
+
+
+	ID differentiation:
+		Kx2 : 10 7F    04 7C ... (manufacturer, extensions, functions, device extensions)
+		Kx3L: 10 6F/7F 04 5C 7D 7D ... (same, but with 2 extra dev ext bytes)
+		RL78: 10 00    06 ... (3: device code)
+
+
+
+ physical layer modes:
+
+ (implicit: nRESET control everywhere)
+
+ 78k0/Kx2: always exists: FLMD0
+     FLMD0: standard/bootloader mode select when nRESET rises/is released
+
+     UART mode: Rx, Tx on UART6 ; LSB-first
+         baudrate: 9.6k until "osc freq set" cmd
+           90 OFS: after status frame received: 115.2k
+         no parity, 8bit, 1 stop bit
+         t_DR between UART frames(start+byte+stop)
+         t_COM timing between response and new cmd
+     SPI mode: nSCK, MOSI, MISO on CSI10 ; MSB-first
+         nSCK: clock polarity: line high by default, data in on rising edge (type 1 aka CPHA=1 CPOL=1)
+           90 OFS: "sets freq" but also "ignored, use 8 MHz"
+         clock freq at 2.5 MHz max
+         t_DR between bytes
+
+     enter sequence:
+      -1. TOOL0 high? hiZ??
+       0. assert RESET (t_DP between nRESET low and FLMD0 hi)
+       1. FLMD0 rises before nRESET (t_PR between FLMD0 hi and nRESET hi)
+       2. FLMD0 cycles/pulses: (wait (t_RP+t_RPE)/2 between nRESET hi and pulses. t_PW as half pulse period)
+            0 = UART with internal clock (X1 aka f_X)
+            3 = UART with external clock (f_{EXTCLK})
+            8 = SPI
+
+ wut:"after each command execution is completed, shut down the power supply to
+      the target after setting the nRESET pin low, set the other pins to hiZ"
+
+ 78K0R/Kx3-L:
+    single-wire UART (LSB-first), that's all
+      start at 9.6k
+      no parity, 8 bit
+      stop bit: prgm->mcu: 2 bits  ;;  mcu->prgm: 1 bit
+      FLMD0: mode
+      TOOL0: half-duplex UART => pullup + hiZ
+
+    enter sequence:
+      0. assert RESET
+      1. FLMD0 rises before nRESET
+      2. TOOL0: send 0x00, recv two(?) 0x00 bytes
+
+   same weird "reset power after each command execution" stuff
+
+
+ RL78:
+   single-wire UART (LSB-first) -> TOOL0
+     baudrate: 115.2k until baudrate set
+     no parity, 1 start bit, 8bit data
+     stop bit: prgm->mcu: 2 bits  ;;  mcu->prgm: 1 bit
+
+  two-wire UART (LSB-first): TOOL0, RX, TX (not all RL78 chips have this!)
+     same format as single-wire
+
+  enter sequence:
+    1. usual VDD/nRESET stuff
+    2. TOOL0: send 0x3A for single-wire, 0x00 for two-wire
+   (3. baudrate set)
+
+   same weird "reset power after each command execution" stuff
+
+
+ flash: blocks of 1024 bytes
+
+ command set:
+    00 reset (UART: send two 0x00 bytes first (with t_12 and t_2C between), before doing first reset cmd, then wait t_WT0)
+    13 verify
+    19 COM_19              # undocumented cmd. sets FSSQ=2 (RL78 only?) @ see rl78-debug from fail0verflow  <------- what is this??
+    20 chip erase (not on RL78)
+    22 block erase
+    32 block blank check
+    40 programming
+    70 status (78k0/Kx2 only. note: UART mode: most other cmds also typically respond with status, doesn't exist in UART)
+    90 osc freq set (78k0/Kx2 only)
+    9A baud rate set (78K0R/Kx3-L and RL78 only. Kx3-L: also has sync,noiseflt,voltage settings. RL78: only baudrate+voltage)
+    A0 security set (78K0R/RL78: also flash shield window)
+    A1 security get (RL78 only)
+    A2 security release (RL78 only)
+    B0 checksum
+    C0 silicon signature (result different for chips, aaa. len: Kx2->0x13  ;;  Kx3-L->0x1b  ;;  RL78->0x16). also weird parity rules
+    C5 version get (00 00 00 FW0 FW1 FW2; same on Kx2 and Kx3-L) => silicon sig data needed (not on RL78)
+
+RL78:
+	#define OCD_VERSION_CMD 0x90
+	#define OCD_CONNECT_CMD 0x91
+	#define OCD_READ_CMD    0x92
+	#define OCD_WRITE_CMD   0x93
+	#define OCD_EXEC_CMD    0x94
+	MODE_OCD = 0xC5 ?
+
+    SYNC = 0x00
+    PING = 0x90
+    UNLOCK = 0x91
+    READ = 0x92
+    WRITE = 0x93
+    EXEC = 0x94
+    EXIT_RETI = 0x95
+    EXIT_RAM = 0x97
+
+	start with OCD_CONNECT, then passcode (10 bytes) and checksum (1 byte, ~ of regular cksum(?))
+	  resp: ACK or other (one byte)
+	OCD_WRITE: addr(2byte)+len(1byte): 0xe0, 0x07, 0x26, // 0xF07E0 location, 0x26 length of packet
+	OCD_EXEC: execute ^ ?
+
+	"OCDERSD bit, which indicates if failure to authenticate via the security key should cause the internal flash to be wiped or not. I found that the ROM does check this bit, but does not actually erase flash upon an error."
+	https://fail0verflow.com/blog/2018/ps4-syscon/
+
+	78k0/Kx2 debug: data on X2/OCD0B, clk to X1/OCD0A, P31/OCD1A PD 10k ; OR: P32/OCD1B data, P31/OCD1A clk ;; 0190 or F7F0 upload area?
+	78K0R/Kx3-L debug: TOOL0(+TOOL1,clksignal out?)
+
+ status set:
+    04 command no error (command not supported)
+    05 parameter error
+    06 ack
+    07 checksum error
+    0F verify error
+    10 protect error (cf. A0 security set)
+    15 nak
+    1A erase verify error (MRG10)
+    1B internal verif. error/blank check error in data write (MRG11)
+    1C write error
+    20 read error (cf. security info?) (78k0/Kx2 only)
+    FF busy (78k0/Kx2 SPI only)
+
+ command frames:
+    cmd : 01 <lenbyte (includes cmd)> <cmdno> <data...> <checksum> 17
+    resp: 02 <lenbyte> <data...> <checksum> [17|03]
+    checksum: subtract from 00 for every byte. bytes included: len, cmd, data
