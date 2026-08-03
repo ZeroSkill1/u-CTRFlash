@@ -327,9 +327,12 @@ enum tool78_stat tool78_do_baud_rate_set(struct tool78_hw* hw) {
 		d0x[3] = 0x00;
 		d0x[4] = 0x00; // Kx3-L only
 
+		// MODIFIED: fixed this fixme
 		// FIXME: 78K0R/Kx3 wants length=4, Kx3-L wants length=5 !
 
-		st = tool78_cmd_send(hw, tool78_cmd_baud_rate_set, 4, d0x);
+		int cmdlen = hw->target_detail == tool78_target_78k0r_kx3l ? 5 : 4;
+
+		st = tool78_cmd_send(hw, tool78_cmd_baud_rate_set, cmdlen, d0x);
 		if (st != tool78_stat_ack) return st;
 
 		//printf("done brs\n");
@@ -1597,16 +1600,13 @@ static enum tool78_stat tool78_init_common(struct tool78_hw* hw) {
 			}
 		}
 
-		// MODIFIED: higher baud does not work with 3DS MCU (in my testing / with my setup)
-		//           therefore, disable higher baud setup (until I find out why it breaks)
-
-		//if ((!(hw->flags & tool78_hw_flag_do_ocd)
-		//		|| (hw->target & tool78_mcu_mask) == tool78_mcu_rl78)
-		//		&& (hw->target & tool78_mcu_mask) != tool78_mcu_78k0) {
-		//	st = tool78_do_generic_baudrate(hw);
-		//	//printf("baudrate result=0x%02x\n", st);
-		//	if (st != tool78_stat_ack) return st;
-		//}
+		if ((!(hw->flags & tool78_hw_flag_do_ocd)
+				|| (hw->target & tool78_mcu_mask) == tool78_mcu_rl78)
+				&& (hw->target & tool78_mcu_mask) != tool78_mcu_78k0) {
+			st = tool78_do_generic_baudrate(hw);
+			//printf("baudrate result=0x%02x\n", st);
+			if (st != tool78_stat_ack) return st;
+		}
 	} else {
 		printf("silisig g10\n");
 		// 0x3a/0xc5 is echoed back as well // TODO err why does this happen?
