@@ -5,7 +5,7 @@
 
 // minimum required to flash 3DS MCU
 
-extern PIO PINOUT_TOOL78_PIO;
+#define PINOUT_TOOL78_PIO pio0
 
 #define PINOUT_TOOL78_RL78_TOOL0 22
 

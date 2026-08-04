@@ -865,6 +865,7 @@ enum tool78_stat tool78_do_security_idauth(struct tool78_hw* hw,
 		const uint8_t passwd[static 10]) {
 	if ((hw->target & tool78_mcu_mask) != tool78_mcu_rl78)
 		return tool78_stat_bad_mcu_for_cmd;
+
 	if (hw->target_detail != tool78_target_rl78_g2x || hw->target_detail != tool78_target_rl78_f2x)
 		return tool78_stat_bad_mcu_for_cmd;
 

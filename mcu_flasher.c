@@ -12,8 +12,6 @@ const uint8_t mcu_firmware[0x4000] = {
 #embed "mcu_firmware.bin"
 };
 
-PIO PINOUT_TOOL78_PIO = pio0;
-
 #ifdef PICO_DEFAULT_LED_PIN
 
 void core1_main() {
@@ -71,26 +69,28 @@ int main() {
 		printf("dv: %02X %02X %02X\n", ver.dv[0], ver.dv[1], ver.dv[2]);
 		printf("fw: %02X %02X %02X\n", ver.fw[0], ver.fw[1], ver.fw[2]);
 
-		struct { uint16_t payload_offs, start, end; } ranges[4] = {
+		struct { uint16_t payload_offs, start, end; } ranges[2] = {
 			{ 0x0   , 0x0   , 0x0FFF },
-			{ 0x1000, 0x2000, 0x2FFF },
-			{ 0x2000, 0x3000, 0x3FFF },
-			{ 0x3000, 0x4000, 0x4FFF },
+			{ 0x1000, 0x2000, 0x4FFF },
 		};
 
 #ifdef PICO_DEFAULT_LED_PIN
 		multicore_launch_core1(core1_main);
 #endif
 
+		uint64_t flash_start_time = time_us_64();
+
 		for (int i = 0; i < count_of(ranges); i++) {
 			if ((m = tool78_do_block_erase(&tool78_hw_78k0r_uart1, ranges[i].start, ranges[i].end)) != tool78_stat_ack) {
 				printf("chip block erase %04X-%04X failed: %02X\n", ranges[i].start, ranges[i].end, m);
+				ok = false;
 				break;
 			}
 			printf("erased block %04X-%04X successfully\n", ranges[i].start, ranges[i].end);
 
 			if ((m = tool78_do_programming(&tool78_hw_78k0r_uart1, ranges[i].start, ranges[i].end, &mcu_firmware[ranges[i].payload_offs])) != tool78_stat_ack) {
 				printf("chip block write %04X-%04X failed: %02X\n", ranges[i].start, ranges[i].end, m);
+				ok = false;
 				break;
 			}
 
@@ -98,21 +98,24 @@ int main() {
 
 			if ((m = tool78_do_verify(&tool78_hw_78k0r_uart1, ranges[i].start, ranges[i].end, &mcu_firmware[ranges[i].payload_offs])) != tool78_stat_ack) {
 				printf("chip block verify %04X-%04X failed: %02X\n", ranges[i].start, ranges[i].end, m);
+				ok = false;
 				break;
 			}
 
 			printf("verified flashed block %04X-%04X successfully\n", ranges[i].start, ranges[i].end);
+			ok = true;
 		}
 
-		ok = true;
+		if (ok) {
+			uint64_t flash_end_time = time_us_64();
+			printf("the MCU firmware has been successfully flashed.\n");
+			float flash_time_ms = (float)(flash_end_time - flash_start_time) / 1000.0f;
+			float flash_time_s = flash_time_ms / 1000.0f;
+			printf("flash time: %.02fs / %.02fms\n", flash_time_s, flash_time_ms);
+		}
 	} while (0);
 
 	tool78_deinit_78k0r();
-
-	if (ok) {
-		printf("the MCU firmware has been successfully flashed.\n");
-	}
-
 
 #ifdef PICO_DEFAULT_LED_PIN
 	multicore_reset_core1();
